@@ -1,0 +1,13 @@
+services:
+  parser:
+    build: .
+    image: telegram-parser:latest
+    volumes:
+      - ./data:/data:ro
+      - ./out:/out
+    # Пример запуска:
+    command: >
+      /data/messages.html
+      --words "кот,собака,мем"
+      --output /out/result.csv
+      --language russian
