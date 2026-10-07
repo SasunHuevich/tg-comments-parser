@@ -1,70 +1,101 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Парсер экспорта Telegram HTML.
-Ищет сообщения, содержащие заданные слова (с учётом морфологии через Snowball),
-и выгружает их в CSV.
+Парсер экспорта Telegram HTML (папка с *.html).
+Ищет сообщения, содержащие заданные слова (Snowball-стемминг),
+выгружает совпадения в CSV, включая имя чата.
 """
 
 import argparse
 import csv
-import os
 import re
 import sys
-from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
 
 try:
     from bs4 import BeautifulSoup
 except ImportError:
-    print("Требуется beautifulsoup4. Установите: pip install beautifulsoup4 lxml", file=sys.stderr)
+    print("Требуется beautifulsoup4. pip install beautifulsoup4 lxml", file=sys.stderr)
     sys.exit(1)
 
 try:
     from nltk.stem.snowball import SnowballStemmer
 except ImportError:
-    print("Требуется nltk. Установите: pip install nltk", file=sys.stderr)
+    print("Требуется nltk. pip install nltk", file=sys.stderr)
     sys.exit(1)
 
 
 # ---------- Утилиты ----------
 
 def normalize_word(word: str) -> str:
-    """Приводит слово к нижнему регистру и убирает пунктуацию по краям."""
     return re.sub(r"^[^\w]+|[^\w]+$", "", word.lower(), flags=re.UNICODE)
 
 
 def tokenize(text: str):
-    """Разбивает текст на токены (слова) с поддержкой кириллицы."""
     return re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", text)
-
 
 def build_stem_filter(search_words, language):
     """
-    Возвращает функцию filter_tokens(tokens) -> (matched_words, all_forms),
-    которая проверяет, есть ли в токенах хотя бы одно совпадение по стемме.
+    Стеммит только "нормальные" слова.
+    Короткие (<3 букв) и аббревиатуры (все заглавные) сравниваются как есть,
+    регистрозависимо.
     """
     stemmer = SnowballStemmer(language)
-    # stem -> исходное искомое слово (первое совпадение)
+
+    # stem -> исходное искомое слово
     target_stems = {}
+    # точные формы (для аббревиатур и коротких слов)
+    exact_targets = set()
+
     for w in search_words:
-        w_norm = normalize_word(w)
+        w_stripped = w.strip()
+        if not w_stripped:
+            continue
+
+        # Аббревиатура: 2+ символа, все буквы заглавные
+        letters = [c for c in w_stripped if c.isalpha()]
+        if letters and all(c.isupper() for c in letters):
+            exact_targets.add(w_stripped)
+            continue
+
+        w_norm = normalize_word(w_stripped)
         if not w_norm:
             continue
-        stem = stemmer.stem(w_norm)
-        target_stems.setdefault(stem, w)
 
-    if not target_stems:
+        # Короткие слова не стеммим
+        if len(w_norm) < 3:
+            exact_targets.add(w_norm)
+            continue
+
+        stem = stemmer.stem(w_norm)
+        target_stems.setdefault(stem, w_stripped)
+
+    if not target_stems and not exact_targets:
         raise ValueError("Список искомых слов пуст после нормализации.")
 
     def match(tokens):
         matched_targets = set()
         matched_forms = set()
+
         for tok in tokens:
+            # 1) точное совпадение (для аббревиатур и коротких)
+            if tok in exact_targets:
+                matched_targets.add(tok)
+                matched_forms.add(tok)
+                continue
+
             tok_norm = normalize_word(tok)
             if not tok_norm:
                 continue
+
+            # 2) короткие токены в тексте тоже не стеммим
+            if len(tok_norm) < 3:
+                if tok_norm in exact_targets:
+                    matched_targets.add(tok_norm)
+                    matched_forms.add(tok_norm)
+                continue
+
+            # 3) обычный стемминг
             try:
                 stem = stemmer.stem(tok_norm)
             except Exception:
@@ -72,46 +103,43 @@ def build_stem_filter(search_words, language):
             if stem in target_stems:
                 matched_targets.add(target_stems[stem])
                 matched_forms.add(tok_norm)
+
         return matched_targets, matched_forms
 
     return match
 
-
 # ---------- Парсинг HTML ----------
 
-class MessageExtractor(HTMLParser):
+def extract_chat_name(soup: BeautifulSoup, html_path: Path) -> str:
     """
-    Быстрый fallback-парсер (используется, если lxml недоступен).
-    Но основной путь — BeautifulSoup.
+    Пытается достать человекочитаемое имя чата:
+    1) div.page_header .content .text.bold
+    2) <title>
+    3) имя файла
     """
-    pass
+    header = soup.select_one("div.page_header .content .text.bold")
+    if header:
+        name = header.get_text(strip=True)
+        if name:
+            return name
+
+    if soup.title and soup.title.string:
+        t = soup.title.string.strip()
+        # в экспорте title часто "Exported Data" — не то, что нам надо
+        if t and t.lower() not in ("exported data",):
+            return t
+
+    return html_path.stem
 
 
-def parse_with_bs4(html_path: Path):
-    """
-    Извлекает сообщения из HTML-экспорта Telegram.
-    Возвращает список dict:
-      {
-        'id': int|str,
-        'date_title': str (ISO-ish),
-        'time_short': str,
-        'author': str,
-        'author_initials': str,
-        'author_link': str|None,
-        'message_link': str|None,
-        'reply_to_id': int|str|None,
-        'text': str,
-        'media_type': str|None,
-        'media_status': str|None,
-        'is_service': bool,
-      }
-    """
+def parse_html_file(html_path: Path):
+    """Парсит один HTML-файл экспорта. Возвращает (chat_name, [messages])."""
     with open(html_path, "r", encoding="utf-8") as f:
         soup = BeautifulSoup(f.read(), "lxml")
 
-    messages = []
+    chat_name = extract_chat_name(soup, html_path)
 
-    # Все сообщения имеют id вида message123
+    messages = []
     for div in soup.select("div.message"):
         classes = div.get("class") or []
         is_service = "service" in classes
@@ -119,7 +147,6 @@ def parse_with_bs4(html_path: Path):
         m = re.match(r"message(-?\d+)$", msg_id_raw)
         msg_id = m.group(1) if m else msg_id_raw
 
-        # ----- Дата и время -----
         date_title = ""
         time_short = ""
         date_div = div.select_one("div.pull_right.date.details") or div.select_one("div.date.details")
@@ -127,14 +154,12 @@ def parse_with_bs4(html_path: Path):
             date_title = date_div.get("title", "").strip()
             time_short = date_div.get_text(strip=True)
 
-        # ----- Автор -----
         author = ""
         author_link = None
         author_initials = ""
         if not is_service:
             from_name_div = div.select_one("div.from_name")
             if from_name_div:
-                # Иногда автор обёрнут в <a>
                 a = from_name_div.find("a")
                 if a and a.get("href"):
                     author_link = a["href"]
@@ -146,17 +171,12 @@ def parse_with_bs4(html_path: Path):
             if initials_div:
                 author_initials = initials_div.get_text(strip=True)
         else:
-            # Сервисные сообщения — текст в div.body.details
             details = div.select_one("div.body.details")
             if details:
                 author = details.get_text(strip=True)
 
-        # ----- Ссылка на это сообщение (если есть reply_to где-то рядом) -----
-        # В самом Telegram-экспорте обычно нет прямой ссылки, но есть reply_to
-        # с onclick="return GoToMessage(N)". Плюс сам id даёт нам "message{N}".
         message_link = f"#go_to_message{msg_id}" if msg_id else None
 
-        # ----- reply_to -----
         reply_to_id = None
         reply_div = div.select_one("div.reply_to")
         if reply_div:
@@ -171,18 +191,15 @@ def parse_with_bs4(html_path: Path):
                     if m3:
                         reply_to_id = m3.group(1)
 
-        # ----- Текст -----
         text = ""
         text_div = div.select_one("div.text")
         if text_div:
-            # убираем спойлеры-скрипты, оставляя видимый текст
             text = text_div.get_text(separator=" ", strip=True)
         elif is_service:
             details = div.select_one("div.body.details")
             if details:
                 text = details.get_text(separator=" ", strip=True)
 
-        # ----- Медиа -----
         media_type = None
         media_status = None
         media_div = div.select_one("div.media_wrap")
@@ -210,15 +227,27 @@ def parse_with_bs4(html_path: Path):
             "media_type": media_type,
             "media_status": media_status,
             "is_service": is_service,
+            "source_file": html_path.name,
         })
 
-    return messages
+    return chat_name, messages
+
+
+def collect_html_files(root: Path):
+    """
+    Возвращает отсортированный список .html файлов внутри root.
+    Если root — файл, вернёт список из одного файла.
+    """
+    if root.is_file():
+        if root.suffix.lower() == ".html":
+            return [root]
+        return []
+    return sorted([p for p in root.rglob("*.html") if p.is_file()])
 
 
 # ---------- Фильтрация ----------
 
 def filter_messages(messages, matcher, include_service=False, include_media_only=False):
-    """Возвращает список (msg, matched_targets, matched_forms) для подходящих сообщений."""
     result = []
     for msg in messages:
         if msg["is_service"] and not include_service:
@@ -238,6 +267,8 @@ def filter_messages(messages, matcher, include_service=False, include_media_only
 # ---------- CSV ----------
 
 CSV_FIELDS = [
+    "chat",
+    "source_file",
     "id",
     "date",
     "time",
@@ -267,11 +298,12 @@ def write_csv(rows, out_path: Path):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Поиск сообщений в Telegram-HTML-экспорте с учётом морфологии (Snowball)."
+        description="Поиск сообщений в папке с Telegram-HTML-экспортом (Snowball)."
     )
-    ap.add_argument("html", type=Path, help="Путь к messages.html")
+    ap.add_argument("path", type=Path,
+                    help="Путь к папке с *.html или к одному messages.html")
     ap.add_argument("-w", "--words", required=True,
-                    help="Список искомых слов через запятую, напр. 'кот,собака,мем'")
+                    help="Список искомых слов через запятую: 'кот,собака,мем'")
     ap.add_argument("-o", "--output", type=Path, default=Path("result.csv"),
                     help="Путь к выходному CSV (по умолчанию result.csv)")
     ap.add_argument("-l", "--language", default="russian",
@@ -279,71 +311,92 @@ def main():
                              "spanish", "italian", "porter"],
                     help="Язык для SnowballStemmer (по умолчанию russian)")
     ap.add_argument("--include-service", action="store_true",
-                    help="Включать сервисные сообщения (channel created и т.п.)")
+                    help="Включать сервисные сообщения")
     ap.add_argument("--include-media-only", action="store_true",
                     help="Включать сообщения без текста, но с медиа")
-    ap.add_argument("--case-sensitive", action="store_true",
-                    help="Учитывать регистр (по умолчанию — нет)")
     ap.add_argument("--unique", action="store_true",
-                    help="Оставить только по одному сообщению на ID")
-
+                    help="Оставить только по одному сообщению на (chat,id)")
+    ap.add_argument("--case-sensitive", action="store_true",
+                    help="Учитывать регистр (зарезервировано)")
     args = ap.parse_args()
 
-    if not args.html.exists():
-        print(f"Файл не найден: {args.html}", file=sys.stderr)
+    if not args.path.exists():
+        print(f"Путь не найден: {args.path}", file=sys.stderr)
         sys.exit(1)
+
+    html_files = collect_html_files(args.path)
+    if not html_files:
+        print(f"В {args.path} не найдено ни одного .html файла", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"→ Найдено HTML-файлов: {len(html_files)}")
+    for p in html_files:
+        print(f"   - {p}")
 
     search_words = [w.strip() for w in args.words.split(",") if w.strip()]
     if not search_words:
         print("Список искомых слов пуст.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"→ Парсинг {args.html} ...")
-    messages = parse_with_bs4(args.html)
-    print(f"  найдено сообщений: {len(messages)}")
-
     matcher = build_stem_filter(search_words, args.language)
 
-    hits = filter_messages(
-        messages,
-        matcher,
-        include_service=args.include_service,
-        include_media_only=args.include_media_only,
-    )
-
-    if args.unique:
-        seen = set()
-        unique_hits = []
-        for msg, mt, mf in hits:
-            if msg["id"] in seen:
-                continue
-            seen.add(msg["id"])
-            unique_hits.append((msg, mt, mf))
-        hits = unique_hits
-
-    print(f"  совпадений: {len(hits)}")
-
     rows = []
-    for msg, matched_targets, matched_forms in hits:
-        rows.append({
-            "id": msg["id"],
-            "date": msg["date_title"],
-            "time": msg["time_short"],
-            "author": msg["author"],
-            "author_initials": msg["author_initials"],
-            "author_link": msg["author_link"] or "",
-            "message_link": msg["message_link"] or "",
-            "reply_to_id": msg["reply_to_id"] or "",
-            "matched_words": ", ".join(matched_targets),
-            "matched_forms": ", ".join(matched_forms),
-            "text": msg["text"],
-            "media_type": msg["media_type"] or "",
-            "media_status": msg["media_status"] or "",
-            "is_service": msg["is_service"],
-        })
+    total_msgs = 0
+    total_hits = 0
+
+    for html_path in html_files:
+        try:
+            chat_name, messages = parse_html_file(html_path)
+        except Exception as e:
+            print(f"  ! Ошибка при парсинге {html_path}: {e}", file=sys.stderr)
+            continue
+
+        total_msgs += len(messages)
+        hits = filter_messages(
+            messages,
+            matcher,
+            include_service=args.include_service,
+            include_media_only=args.include_media_only,
+        )
+
+        if args.unique:
+            seen = set()
+            unique_hits = []
+            for msg, mt, mf in hits:
+                key = (chat_name, msg["id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_hits.append((msg, mt, mf))
+            hits = unique_hits
+
+        total_hits += len(hits)
+        print(f"  → {html_path.name}: чат='{chat_name}', сообщений={len(messages)}, совпадений={len(hits)}")
+
+        for msg, matched_targets, matched_forms in hits:
+            rows.append({
+                "chat": chat_name,
+                "source_file": msg["source_file"],
+                "id": msg["id"],
+                "date": msg["date_title"],
+                "time": msg["time_short"],
+                "author": msg["author"],
+                "author_initials": msg["author_initials"],
+                "author_link": msg["author_link"] or "",
+                "message_link": msg["message_link"] or "",
+                "reply_to_id": msg["reply_to_id"] or "",
+                "matched_words": ", ".join(matched_targets),
+                "matched_forms": ", ".join(matched_forms),
+                "text": msg["text"],
+                "media_type": msg["media_type"] or "",
+                "media_status": msg["media_status"] or "",
+                "is_service": msg["is_service"],
+            })
 
     write_csv(rows, args.output)
-    print(f"✓ Результат сохранён: {args.output} ({len(rows)} строк)")
+    print(f"\n✓ Всего сообщений: {total_msgs}")
+    print(f"✓ Всего совпадений: {total_hits}")
+    print(f"✓ Результат: {args.output}")
 
 
 if __name__ == "__main__":

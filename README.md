@@ -9,10 +9,10 @@
 
 ## Что это вообще такое
 
-Скрипт берёт HTML-экспорт Telegram-чата (тот самый messages.html, который
-выгружается через Settings -> Advanced -> Export chat history), ищет в сообщениях
-заданные слова с учётом морфологии (через Snowball-стеммер, т.е. "кот" найдёт
-"кота", "коты", "котом" и т.д.) и складывает все подходящие сообщения в CSV.
+Скрипт берёт ПАПКУ с HTML-экспортом Telegram-чата (все *.html внутри неё),
+ищет в сообщениях заданные слова с учётом морфологии (Snowball-стеммер,
+т.е. "кот" найдёт "кота", "коты", "котом" и т.д.) и складывает все подходящие
+сообщения в CSV. В CSV также пишется имя чата, к которому относится сообщение.
 
 Всё. Больше он ничего не умеет. И не должен.
 
@@ -35,7 +35,7 @@ telegram_parser/
   requirements.txt     # зависимости Python
   Dockerfile           # образ
   docker-compose.yml   # (опционально) запуск в один клик
-  data/                # сюда кидать messages.html (создать вручную)
+  data/                # сюда кидать ПАПКУ с экспортом (создать вручную)
   out/                 # сюда упадёт result.csv (создать вручную)
   README.md            # ты здесь
 
@@ -47,18 +47,30 @@ telegram_parser/
 
 1. Выгрузи HTML-экспорт чата из Telegram:
    Настройки -> Продвинутые -> Экспорт данных -> выбрать чат -> формат HTML.
-2. Найди файл messages.html (он лежит в папке типа ChatExport_2024-XX-XX/).
-3. Положи его в ./data/.
+2. У тебя получится папка типа ChatExport_2024-XX-XX/,
+   внутри неё как минимум messages.html, а иногда ещё messages2.html, messages3.html и т.п.
+3. Положи ВСЮ эту папку в ./data/ (или скопируй туда все *.html).
 
     mkdir -p data out
-    cp /путь/до/ChatExport_*/messages.html data/
+    cp -r /путь/до/ChatExport_* data/
+
+После этого в ./data/ лежит что-то типа:
+    data/ChatExport_2024-01-01/messages.html
+    data/ChatExport_2024-01-01/messages2.html
+    ...
+
+Можно также кинуть просто кучу *.html прямо в ./data/ — рекурсивный обход тоже работает.
 
 ---
 
 ### Вариант 1. Локально (без Docker)
 
     pip install -r requirements.txt
-    python parser.py data/messages.html -w "кот,собака,мем" -o out/result.csv
+    python parser.py data/ -w "кот,собака,мем" -o out/result.csv
+
+Вместо папки можно передать один файл:
+
+    python parser.py data/messages.html -w "кот" -o out/result.csv
 
 ---
 
@@ -67,46 +79,44 @@ telegram_parser/
     # собрать образ
     docker build -t tg-parser .
 
-    # запустить
+    # запустить на папке ./data, результат в ./out/result.csv
     docker run --rm \
-      -v "$PWD/data:/data:ro" \
+      -v "$PWD/data:/in:ro" \
       -v "$PWD/out:/out" \
-      tg-parser /data/messages.html \
+      tg-parser /in \
         --words "кот,собака,мем" \
         --output /out/result.csv \
         --language russian
-
-После запуска результат лежит в ./out/result.csv.
 
 ---
 
 ### Вариант 3. Через docker-compose (совсем лениво)
 
     mkdir -p data out
-    cp messages.html data/
+    cp -r /путь/до/ChatExport_* data/
     docker compose run --rm parser
 
 Слова и путь можно переопределить прямо в командной строке:
 
     docker compose run --rm parser \
-      /data/messages.html --words "привет,мир" --output /out/result.csv
+      /in --words "привет,мир" --output /out/result.csv
 
 ---
 
 ## Аргументы командной строки
 
-  html (позиционный)          путь к messages.html                       (обязателен)
-  -w, --words                 список слов через запятую                  (обязателен)
-  -o, --output                путь к CSV                                 result.csv
-  -l, --language              язык для Snowball (russian, english, ...)  russian
-  --include-service           включить сервисные сообщения               выкл
-  --include-media-only        включить сообщения без текста, но с медиа  выкл
-  --unique                    не дублировать сообщения по ID             выкл
-  --case-sensitive            учитывать регистр (зарезервировано)        выкл
+  path (позиционный)          папка с *.html ИЛИ один messages.html        (обязателен)
+  -w, --words                 список слов через запятую                    (обязателен)
+  -o, --output                путь к CSV                                   result.csv
+  -l, --language              язык для Snowball (russian, english, ...)    russian
+  --include-service           включить сервисные сообщения                 выкл
+  --include-media-only        включить сообщения без текста, но с медиа    выкл
+  --unique                    не дублировать сообщения по (chat, id)       выкл
+  --case-sensitive            учитывать регистр (зарезервировано)          выкл
 
 Пример с несколькими словами:
 
-    python parser.py data/messages.html \
+    python parser.py data/ \
       -w "привет,мем,кот,собака" \
       -o out/hits.csv \
       -l russian \
@@ -116,6 +126,8 @@ telegram_parser/
 
 ## Что получается в CSV
 
+  chat              имя чата (из page_header .text.bold, title или имени файла)
+  source_file       имя html-файла, откуда взято сообщение
   id                ID сообщения из HTML
   date              дата (из атрибута title)
   time              короткое время (00:38)
@@ -132,6 +144,18 @@ telegram_parser/
   is_service        сервисное ли сообщение
 
 Кодировка — utf-8-sig, чтобы Excel не ругался на кириллицу.
+
+---
+
+## Как определяется имя чата
+
+По порядку:
+  1. div.page_header .content .text.bold  (то, что видно в шапке экспорта)
+  2. <title>, если это не служебное "Exported Data"
+  3. имя html-файла без расширения (fallback)
+
+Если экспорт содержит несколько чатов в одной папке — каждый файл
+обрабатывается отдельно, и в CSV у каждой строки будет своё имя чата.
 
 ---
 
