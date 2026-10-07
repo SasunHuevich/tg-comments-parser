@@ -34,6 +34,7 @@ def normalize_word(word: str) -> str:
 def tokenize(text: str):
     return re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", text)
 
+
 def build_stem_filter(search_words, language):
     """
     Стеммит только "нормальные" слова.
@@ -42,9 +43,7 @@ def build_stem_filter(search_words, language):
     """
     stemmer = SnowballStemmer(language)
 
-    # stem -> исходное искомое слово
     target_stems = {}
-    # точные формы (для аббревиатур и коротких слов)
     exact_targets = set()
 
     for w in search_words:
@@ -52,7 +51,6 @@ def build_stem_filter(search_words, language):
         if not w_stripped:
             continue
 
-        # Аббревиатура: 2+ символа, все буквы заглавные
         letters = [c for c in w_stripped if c.isalpha()]
         if letters and all(c.isupper() for c in letters):
             exact_targets.add(w_stripped)
@@ -62,7 +60,6 @@ def build_stem_filter(search_words, language):
         if not w_norm:
             continue
 
-        # Короткие слова не стеммим
         if len(w_norm) < 3:
             exact_targets.add(w_norm)
             continue
@@ -78,7 +75,6 @@ def build_stem_filter(search_words, language):
         matched_forms = set()
 
         for tok in tokens:
-            # 1) точное совпадение (для аббревиатур и коротких)
             if tok in exact_targets:
                 matched_targets.add(tok)
                 matched_forms.add(tok)
@@ -88,14 +84,12 @@ def build_stem_filter(search_words, language):
             if not tok_norm:
                 continue
 
-            # 2) короткие токены в тексте тоже не стеммим
             if len(tok_norm) < 3:
                 if tok_norm in exact_targets:
                     matched_targets.add(tok_norm)
                     matched_forms.add(tok_norm)
                 continue
 
-            # 3) обычный стемминг
             try:
                 stem = stemmer.stem(tok_norm)
             except Exception:
@@ -108,15 +102,10 @@ def build_stem_filter(search_words, language):
 
     return match
 
+
 # ---------- Парсинг HTML ----------
 
 def extract_chat_name(soup: BeautifulSoup, html_path: Path) -> str:
-    """
-    Пытается достать человекочитаемое имя чата:
-    1) div.page_header .content .text.bold
-    2) <title>
-    3) имя файла
-    """
     header = soup.select_one("div.page_header .content .text.bold")
     if header:
         name = header.get_text(strip=True)
@@ -125,7 +114,6 @@ def extract_chat_name(soup: BeautifulSoup, html_path: Path) -> str:
 
     if soup.title and soup.title.string:
         t = soup.title.string.strip()
-        # в экспорте title часто "Exported Data" — не то, что нам надо
         if t and t.lower() not in ("exported data",):
             return t
 
@@ -133,7 +121,6 @@ def extract_chat_name(soup: BeautifulSoup, html_path: Path) -> str:
 
 
 def parse_html_file(html_path: Path):
-    """Парсит один HTML-файл экспорта. Возвращает (chat_name, [messages])."""
     with open(html_path, "r", encoding="utf-8") as f:
         soup = BeautifulSoup(f.read(), "lxml")
 
@@ -234,10 +221,6 @@ def parse_html_file(html_path: Path):
 
 
 def collect_html_files(root: Path):
-    """
-    Возвращает отсортированный список .html файлов внутри root.
-    Если root — файл, вернёт список из одного файла.
-    """
     if root.is_file():
         if root.suffix.lower() == ".html":
             return [root]
@@ -247,20 +230,37 @@ def collect_html_files(root: Path):
 
 # ---------- Фильтрация ----------
 
-def filter_messages(messages, matcher, include_service=False, include_media_only=False):
+def filter_messages(messages, matcher, exclude_patterns=None,
+                    include_service=False, include_media_only=False,
+                    min_matches=1):
+    """
+    exclude_patterns — список скомпилированных regex'ов.
+    Если в тексте есть ЛЮБОЕ совпадение — сообщение отбрасывается.
+    """
+    exclude_patterns = exclude_patterns or []
     result = []
+
     for msg in messages:
         if msg["is_service"] and not include_service:
             continue
         text = msg["text"] or ""
         if not text and not include_media_only:
             continue
+
+        # 1) выкидываем по чёрному списку фраз
+        if any(rx.search(text) for rx in exclude_patterns):
+            continue
+
+        # 2) обычный поиск
         tokens = tokenize(text)
         if not tokens:
             continue
         matched_targets, matched_forms = matcher(tokens)
-        if matched_targets:
-            result.append((msg, sorted(matched_targets), sorted(matched_forms)))
+        if len(matched_targets) < min_matches:
+            continue
+
+        result.append((msg, sorted(matched_targets), sorted(matched_forms)))
+
     return result
 
 
@@ -318,7 +318,25 @@ def main():
                     help="Оставить только по одному сообщению на (chat,id)")
     ap.add_argument("--case-sensitive", action="store_true",
                     help="Учитывать регистр (зарезервировано)")
+    ap.add_argument("--exclude-phrases", default="",
+                    help="Список фраз через || (двойной вертикальный слэш), "
+                         "при наличии любой из них сообщение отбрасывается. "
+                         "Пример: 'Подпишись на новости Иркутска||реклама||erid:'")
+    ap.add_argument("--min-matches", type=int, default=1,
+                    help="Минимальное число разных искомых слов в сообщении "
+                         "(по умолчанию 1)")
     args = ap.parse_args()
+
+    exclude_patterns = []
+    if args.exclude_phrases.strip():
+        for phrase in args.exclude_phrases.split("||"):
+            phrase = phrase.strip()
+            if not phrase:
+                continue
+            exclude_patterns.append(re.compile(re.escape(phrase), re.IGNORECASE))
+        print(f"→ Чёрный список фраз ({len(exclude_patterns)}):")
+        for p in exclude_patterns:
+            print(f"   - {p.pattern}")
 
     if not args.path.exists():
         print(f"Путь не найден: {args.path}", file=sys.stderr)
@@ -355,8 +373,10 @@ def main():
         hits = filter_messages(
             messages,
             matcher,
+            exclude_patterns=exclude_patterns,
             include_service=args.include_service,
             include_media_only=args.include_media_only,
+            min_matches=args.min_matches,
         )
 
         if args.unique:

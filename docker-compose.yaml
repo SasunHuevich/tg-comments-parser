@@ -8,6 +8,7 @@ services:
       - ./out:/out
     command: >
       /in 
-      --words "нейросеть,нейронка,ИИ,алгоритм,бэкпроп,датасет,эмбеддинг,токен,GAN,автоэнкодер,генератор,LLM,GPT,ChatGPT,BERT,Gemini,Claude,Llama,Grok,OpenAI,DeepMind,Anthropic,NVIDIA,TensorFlow,PyTorch,промпт,галлюцинация" 
+      --words "нейросеть,нейронка,ИИ,алгоритм,бэкпроп,датасет,эмбеддинг,токен,GAN,автоэнкодер,генератор,LLM,GPT,ChatGPT,BERT,Gemini,Claude,Llama,Grok,OpenAI,DeepMind,Anthropic,NVIDIA,TensorFlow,PyTorch,промпт,галлюцинация"
+      --exclude-phrases "Подпишись на новости Иркутска||Подписывайтесь на новости Иркутска"
       --output /out/result.csv 
       --language russian
